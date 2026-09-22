@@ -42,7 +42,20 @@ from atom.distributed.pp_comm import (
 )
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
 from atom.kv_transfer.disaggregation import KVConnectorOutput
+from atom.model_engine.gpu_timing import (
+    create_gpu_timing_recorder,
+    gpu_timing_batch_method,
+    gpu_timing_forward_method,
+)
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.moe_route_replay import (
+    MoERouteHistogramProvider,
+    MoERouteReplayError,
+    create_moe_route_recorder,
+    moe_route_forward_method,
+    set_active_route_lifecycle,
+    validate_capture_config,
+)
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
@@ -641,6 +654,7 @@ class ModelRunner:
 
         set_graph_marker_enabled(self.mark_trace)
         set_current_atom_config(config)
+        validate_capture_config(config)
         hf_config = config.hf_config
         self.block_size = config.kv_cache_block_size
         self.kv_cache_dtype = config.kv_cache_dtype
@@ -678,6 +692,10 @@ class ModelRunner:
         # so that dp config fields are still at their original values)
         self.profiler = None
         self.profiler_dir = None
+        self._runtime_trace_steps_remaining: int | None = None
+        self._extend_trace_armed = False
+        self._extend_trace_case_id: int | None = None
+        self._extend_trace_started_at: float | None = None
         dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
         if dp_rank_local > 0 or config.parallel_config.data_parallel_size > 1:
             self.rank_name = f"dp{dp_rank_local}_tp{rank}"
@@ -840,6 +858,10 @@ class ModelRunner:
                 self.drafter.model = torch.compile(
                     self.drafter.model, fullgraph=True, backend="eager"
                 )
+        self._moe_route_recorder = create_moe_route_recorder(
+            config, tensor_parallel_rank=rank
+        )
+        self._gpu_timing_recorder = create_gpu_timing_recorder(self)
 
     def _build_and_load_model(self, model_class):
         """Construct the model and load its weights from disk.
@@ -1059,6 +1081,32 @@ class ModelRunner:
         if not self.still_running:
             return
         self.still_running = False
+        route_recorder = getattr(self, "_moe_route_recorder", None)
+        if route_recorder is not None:
+            try:
+                route_recorder.close()
+            except Exception:  # noqa: BLE001 - teardown must continue
+                logger.exception(
+                    "Rank %d: MoE route recorder cleanup failed", self.rank
+                )
+            finally:
+                set_active_route_lifecycle(None)
+        if getattr(self, "profiler", None) is not None:
+            try:
+                self.stop_profiler()
+            except Exception:  # noqa: BLE001 - teardown must continue
+                logger.exception(
+                    "Rank %d: profiler cleanup failed during runner exit",
+                    self.rank,
+                )
+        timing_recorder = getattr(self, "_gpu_timing_recorder", None)
+        if timing_recorder is not None:
+            try:
+                timing_recorder.close()
+            except Exception:  # noqa: BLE001 - teardown must continue
+                logger.exception(
+                    "Rank %d: timing recorder cleanup failed", self.rank
+                )
         # 0. Join any offload connector's copy threads. Its ThreadPoolExecutors
         #    are non-daemon, so leaving them running wedges interpreter shutdown
         #    or races an in-flight copy against atexit. Must run BEFORE the KV
@@ -1067,10 +1115,20 @@ class ModelRunner:
         connector = get_kvconnector()
         close = getattr(connector, "close", None) if connector is not None else None
         if callable(close):
-            close()
+            try:
+                close()
+            except Exception:  # noqa: BLE001 - teardown must continue
+                logger.exception(
+                    "Rank %d: KV connector cleanup failed", self.rank
+                )
         # 1. Destroy distributed env (NCCL + CustomAllreduce + process groups)
         #    Must happen while ops module is still alive for CustomAllreduce cleanup.
-        destroy_dist_env()
+        try:
+            destroy_dist_env()
+        except Exception:  # noqa: BLE001 - release local GPU objects next
+            logger.exception(
+                "Rank %d: distributed environment cleanup failed", self.rank
+            )
         # 2. Release CUDA graphs
         if not self.enforce_eager:
             self.graphs = self.graph_pool = None  # type: ignore
@@ -1091,19 +1149,56 @@ class ModelRunner:
             del self.model
         if hasattr(self, "drafter"):
             del self.drafter
-        torch.cuda.empty_cache()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001 - process is already exiting
+            logger.exception("Rank %d: CUDA cache cleanup failed", self.rank)
         return True
 
     def start_profiler(self, trace_name: str | None = None):
         """
         Start profiling for this rank.
 
-        The ATOM_PROFILER_MORE environment variable controls detailed profiling features:
-        - Set to "1" to enable record_shapes, with_stack, and profile_memory.
-        - Set to "0" or unset to disable these features (default).
+        EXTEND-only workload traces are intentionally captured on TP rank 0.
+        Kimi-K3's TP-only routing and forward shapes are replicated across
+        ranks, and recording every rank multiplies trace size without adding a
+        separate replay input.
+
+        Detailed profiling features are controlled independently by
+        ATOM_PROFILER_RECORD_SHAPES, ATOM_PROFILER_WITH_STACK, and
+        ATOM_PROFILER_PROFILE_MEMORY.  Unset controls inherit the legacy
+        ATOM_PROFILER_MORE value.
         """
-        if self.profiler_dir is not None and self.profiler is None:
-            enable_detailed_profiling = envs.ATOM_PROFILER_MORE
+        if envs.ATOM_EXTEND_TRACE and self.rank != 0:
+            logger.info(
+                "Rank %d: skipping EXTEND profiler (rank 0 only)",
+                self.rank,
+            )
+            return True
+        if self.profiler_dir is None:
+            raise RuntimeError(
+                "torch profiler output is not configured; set "
+                "ATOM_TORCH_PROFILER_DIR or --torch-profiler-dir"
+            )
+        if envs.ATOM_EXTEND_TRACE:
+            self._extend_trace_armed = True
+            self._extend_trace_started_at = time.monotonic()
+            logger.info(
+                "Rank %d: armed per-forward EXTEND profiler "
+                "(shapes=%s, stack=%s, memory=%s, dir=%s)",
+                self.rank,
+                envs.ATOM_PROFILER_RECORD_SHAPES,
+                envs.ATOM_PROFILER_WITH_STACK,
+                envs.ATOM_PROFILER_PROFILE_MEMORY,
+                self.profiler_dir,
+            )
+            return True
+        if self.profiler is None:
+            trace_steps = None
+            if envs.ATOM_RUNTIME_TRACE:
+                trace_steps = envs.ATOM_RUNTIME_TRACE_STEPS
+                if trace_steps <= 0:
+                    raise ValueError("ATOM_RUNTIME_TRACE_STEPS must be positive")
             model_name = os.path.basename(self.config.model.rstrip("/"))
             safe_model_name = "".join(
                 c if c.isalnum() or c in ("_", "-", ".") else "_" for c in model_name
@@ -1127,6 +1222,7 @@ class ModelRunner:
                 ms = int((time.time() % 1) * 1000)
                 output_path = f"{output_prefix}_ts_{ts}_{ms:03d}.pt.trace.json.gz"
                 tmp_json_path = output_path[:-3]
+                tmp_gzip_path = f"{output_path}.tmp"
                 try:
                     t0 = time.monotonic()
                     prof.export_chrome_trace(tmp_json_path)
@@ -1134,11 +1230,12 @@ class ModelRunner:
                     # the entire JSON (~30 GB) into memory at once.
                     with (
                         open(tmp_json_path, "rb") as src,
-                        _gzip.open(output_path, "wb") as dst,
+                        _gzip.open(tmp_gzip_path, "wb") as dst,
                     ):
                         while chunk := src.read(64 * 1024 * 1024):
                             dst.write(chunk)
                     os.remove(tmp_json_path)
+                    os.replace(tmp_gzip_path, output_path)
                     sz = os.path.getsize(output_path)
                     logger.info(
                         "Rank %d: trace exported to %s (%.1f MB, %.1fs)",
@@ -1153,7 +1250,7 @@ class ModelRunner:
                         self.rank,
                         output_path,
                     )
-                    for p in (tmp_json_path, output_path):
+                    for p in (tmp_json_path, tmp_gzip_path, output_path):
                         if os.path.exists(p):
                             os.remove(p)
 
@@ -1162,19 +1259,106 @@ class ModelRunner:
                     torch_profiler.ProfilerActivity.CPU,
                     torch_profiler.ProfilerActivity.CUDA,
                 ],
-                record_shapes=enable_detailed_profiling,
-                with_stack=enable_detailed_profiling,
-                profile_memory=enable_detailed_profiling,
+                record_shapes=envs.ATOM_PROFILER_RECORD_SHAPES,
+                with_stack=envs.ATOM_PROFILER_WITH_STACK,
+                profile_memory=envs.ATOM_PROFILER_PROFILE_MEMORY,
                 on_trace_ready=_on_trace_ready,
             )
             self.profiler.__enter__()
+            self._runtime_trace_steps_remaining = trace_steps
             logger.info(
-                "Rank %d: profiler started (detailed=%s, dir=%s)",
+                "Rank %d: profiler started "
+                "(shapes=%s, stack=%s, memory=%s, dir=%s, steps=%s)",
                 self.rank,
-                enable_detailed_profiling,
+                envs.ATOM_PROFILER_RECORD_SHAPES,
+                envs.ATOM_PROFILER_WITH_STACK,
+                envs.ATOM_PROFILER_PROFILE_MEMORY,
                 self.profiler_dir,
+                self._runtime_trace_steps_remaining,
             )
         return True
+
+    def _start_extend_trace_profiler(self, batch: ScheduledBatch) -> bool:
+        """Start a fresh profiler for one replayable pure EXTEND forward."""
+        if not self._extend_trace_armed or self.profiler is not None:
+            return False
+        case_id = getattr(batch, "replay_case_id", None)
+        if case_id is None:
+            return False
+
+        torch.cuda.synchronize(self.device)
+        self.profiler = torch_profiler.profile(
+            activities=[
+                torch_profiler.ProfilerActivity.CPU,
+                torch_profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=envs.ATOM_PROFILER_RECORD_SHAPES,
+            with_stack=envs.ATOM_PROFILER_WITH_STACK,
+            profile_memory=envs.ATOM_PROFILER_PROFILE_MEMORY,
+        )
+        self._extend_trace_case_id = int(case_id)
+        try:
+            self.profiler.start()
+        except BaseException:
+            self.profiler = None
+            self._extend_trace_case_id = None
+            raise
+        return True
+
+    def _stop_extend_trace_profiler(self) -> None:
+        """Stop and export the currently active per-EXTEND profiler."""
+        profiler = self.profiler
+        case_id = self._extend_trace_case_id
+        if profiler is None or case_id is None:
+            return
+
+        cases_dir = os.path.join(self.profiler_dir, "cases")
+        output_path = os.path.join(
+            cases_dir, f"case_{case_id:06d}.trace.json.gz"
+        )
+        tmp_json_path = f"{output_path}.json.tmp"
+        tmp_gzip_path = f"{output_path}.tmp"
+        try:
+            torch.cuda.synchronize(self.device)
+            profiler.stop()
+            os.makedirs(cases_dir, exist_ok=True)
+            profiler.export_chrome_trace(tmp_json_path)
+            import gzip as _gzip
+
+            with (
+                open(tmp_json_path, "rb") as src,
+                _gzip.open(tmp_gzip_path, "wb") as dst,
+            ):
+                while chunk := src.read(64 * 1024 * 1024):
+                    dst.write(chunk)
+            os.replace(tmp_gzip_path, output_path)
+            logger.info(
+                "Rank %d: exported EXTEND case %d trace to %s",
+                self.rank,
+                case_id,
+                output_path,
+            )
+        finally:
+            self.profiler = None
+            self._extend_trace_case_id = None
+            for path in (tmp_json_path, tmp_gzip_path):
+                if os.path.exists(path):
+                    os.remove(path)
+
+    def _advance_runtime_trace_profiler(self):
+        """Stop an API-triggered runtime trace after the requested forwards."""
+        remaining = self._runtime_trace_steps_remaining
+        if self.profiler is None or remaining is None:
+            return
+        remaining -= 1
+        self._runtime_trace_steps_remaining = remaining
+        if remaining == 0:
+            logger.info(
+                "Rank %d: runtime trace reached %d forwards",
+                self.rank,
+                envs.ATOM_RUNTIME_TRACE_STEPS,
+            )
+            self.stop_profiler()
 
     def stop_profiler(self):
         """Stop profiling for this rank.
@@ -1182,6 +1366,19 @@ class ModelRunner:
         Returns a dict with ``trace_dir`` and ``elapsed`` so the caller
         can report where the trace was written.
         """
+        if envs.ATOM_EXTEND_TRACE and self._extend_trace_armed:
+            t0 = self._extend_trace_started_at or time.monotonic()
+            self._extend_trace_armed = False
+            if self.profiler is not None:
+                self._stop_extend_trace_profiler()
+            self._extend_trace_started_at = None
+            elapsed = round(time.monotonic() - t0, 1)
+            logger.info(
+                "Rank %d: per-forward EXTEND profiler disarmed in %.1fs",
+                self.rank,
+                elapsed,
+            )
+            return {"trace_dir": self.profiler_dir, "elapsed": elapsed}
         if self.profiler is None:
             return {"trace_dir": self.profiler_dir, "elapsed": 0.0}
         t0 = time.monotonic()
@@ -1192,6 +1389,7 @@ class ModelRunner:
             logger.exception("Rank %d: profiler stop failed", self.rank)
         finally:
             self.profiler = None
+            self._runtime_trace_steps_remaining = None
         elapsed = round(time.monotonic() - t0, 1)
         logger.info(
             "Rank %d: profiler stop completed in %.1fs",
@@ -1203,6 +1401,39 @@ class ModelRunner:
     def debug(self, *args: Any):
         if self.rank == 0:
             logger.info(*args)
+
+    def prepare_moe_route_replay(
+        self,
+        case_id: int,
+        routes: dict[str, Any],
+    ) -> bool:
+        if getattr(self, "_moe_route_recorder", None) is not None:
+            raise MoERouteReplayError(
+                "synthetic route replay cannot replace an active route recorder"
+            )
+        provider = MoERouteHistogramProvider(
+            {int(case_id): routes},
+            device=self.device,
+        )
+        set_active_route_lifecycle(provider)
+        self._moe_route_provider = provider
+        return True
+
+    def clear_moe_route_replay(self) -> dict[str, Any]:
+        provider = getattr(self, "_moe_route_provider", None)
+        result = {
+            "case_id": None,
+            "verified_layers": [],
+        }
+        if provider is not None:
+            result = {
+                "case_id": provider.last_verified_case_id,
+                "verified_layers": list(provider.last_verified_layers),
+            }
+            provider.abort_forward()
+            set_active_route_lifecycle(None)
+            self._moe_route_provider = None
+        return result
 
     def dummy_execution(self):
         """Execute dummy decode batch for DP synchronization.
@@ -2882,6 +3113,7 @@ class ModelRunner:
                 self._pp_index_topk,
             )
 
+    @gpu_timing_forward_method("target")
     def run_model(
         self,
         input_ids: torch.Tensor,
@@ -3289,6 +3521,8 @@ class ModelRunner:
 
     @torch.inference_mode()
     @with_eplb_forward_monitor
+    @moe_route_forward_method
+    @gpu_timing_batch_method
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         # Make this forward's staging buffers safe to overwrite before
         # prepare_inputs writes them: rotate to a free slot if there is a ring,
@@ -3428,6 +3662,7 @@ class ModelRunner:
             finished_sending=done_sending, finished_recving=done_recving
         )
 
+    @gpu_timing_forward_method("draft")
     def propose_draft_token_ids(
         self,
         batch: ScheduledBatch,
@@ -3535,7 +3770,6 @@ class ModelRunner:
             self.profiler_dir is not None and self.mark_trace
         )
         if self._capture_profile_enabled:
-            enable_detailed_profiling = envs.ATOM_PROFILER_MORE
             self._capture_trace_tag = None
             self.capture_traces_dir = os.path.join(self.profiler_dir, "capture_traces")
             os.makedirs(self.capture_traces_dir, exist_ok=True)
@@ -3574,9 +3808,9 @@ class ModelRunner:
                 # capture loop lands in its own file with nothing dropped between
                 # them (wait>0 would silently skip alternate batch sizes).
                 schedule=torch_profiler.schedule(wait=0, warmup=0, active=1, repeat=0),
-                record_shapes=enable_detailed_profiling,
-                with_stack=enable_detailed_profiling,
-                profile_memory=enable_detailed_profiling,
+                record_shapes=envs.ATOM_PROFILER_RECORD_SHAPES,
+                with_stack=envs.ATOM_PROFILER_WITH_STACK,
+                profile_memory=envs.ATOM_PROFILER_PROFILE_MEMORY,
                 on_trace_ready=on_trace_ready,
             )
         else:

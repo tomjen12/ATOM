@@ -257,6 +257,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # --- Profiling & Logging ---
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
+    # Automatically stop an API-triggered runtime trace after this many model
+    # runner forwards. The runner validates that the value is positive.
+    "ATOM_RUNTIME_TRACE": lambda: os.getenv("ATOM_RUNTIME_TRACE", "0") == "1",
+    "ATOM_RUNTIME_TRACE_STEPS": lambda: int(
+        os.getenv("ATOM_RUNTIME_TRACE_STEPS", "100")
+    ),
+    # Profile only pure prefill/EXTEND batches for the active profiling window.
+    # Unlike ATOM_RUNTIME_TRACE, this mode is stopped by the benchmark phase,
+    # not by ATOM_RUNTIME_TRACE_STEPS.
+    "ATOM_EXTEND_TRACE": lambda: (
+        os.getenv("ATOM_EXTEND_TRACE", "0") == "1"
+    ),
+    # Record rank-zero scheduler-batch and target/draft GPU envelopes without
+    # collecting a heavyweight PyTorch/Runtime trace.
+    "ATOM_WORKLOAD_RECORD_ALL": lambda: (
+        os.getenv("ATOM_WORKLOAD_RECORD_ALL", "0") == "1"
+    ),
     # Move the startup heap (model, compiled graph, tokenizer, KV block pool)
     # into CPython's permanent generation once warmup is done, so collections
     # stop scanning it.  On by default; set 0 to keep the old behaviour.
@@ -271,6 +288,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the passes out.  See tune_gc in atom/utils/gc_utils.py.
     "ATOM_GC_THRESHOLD": lambda: os.getenv("ATOM_GC_THRESHOLD", "").strip(),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
+    # Independent torch.profiler controls.  An unset control inherits
+    # ATOM_PROFILER_MORE so the legacy all-or-nothing switch remains compatible.
+    "ATOM_PROFILER_RECORD_SHAPES": lambda: (
+        os.getenv(
+            "ATOM_PROFILER_RECORD_SHAPES",
+            os.getenv("ATOM_PROFILER_MORE", "0"),
+        )
+        == "1"
+    ),
+    "ATOM_PROFILER_WITH_STACK": lambda: (
+        os.getenv(
+            "ATOM_PROFILER_WITH_STACK",
+            os.getenv("ATOM_PROFILER_MORE", "0"),
+        )
+        == "1"
+    ),
+    "ATOM_PROFILER_PROFILE_MEMORY": lambda: (
+        os.getenv(
+            "ATOM_PROFILER_PROFILE_MEMORY",
+            os.getenv("ATOM_PROFILER_MORE", "0"),
+        )
+        == "1"
+    ),
     # When profiling is active, append detailed attention aggregates (sqsq, sqsk, sk)
     # to the prefill[]/decode[] trace labels emitted by ModelRunner.run_model.
     "ATOM_ENABLE_DETAILED_ANNOTATION": lambda: (
@@ -385,6 +425,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # eager. Named for the draft, not a flavor -- see `DraftGraph.will_capture`.
     "ATOM_DRAFT_CUDAGRAPH": lambda: (
         os.getenv("ATOM_DRAFT_CUDAGRAPH", "1").lower() == "1"
+    ),
+    # Capture logical prefill batches for native ATOM round-trip replay.
+    "ATOM_WORKLOAD_RECORD_PREFILL": lambda: (
+        os.getenv("ATOM_WORKLOAD_RECORD_PREFILL", "0") == "1"
+    ),
+    # 0 records every prefill; positive values stop after that many cases.
+    "ATOM_PREFILL_REPLAY_MAX_CASES": lambda: int(
+        os.getenv("ATOM_PREFILL_REPLAY_MAX_CASES", "0")
     ),
     # --- MoE (DeepSeek-style shared experts) ---
     # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.

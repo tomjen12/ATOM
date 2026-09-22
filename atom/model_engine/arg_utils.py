@@ -4,6 +4,7 @@
 import argparse
 import json
 import logging
+import os
 from dataclasses import dataclass, fields
 
 from atom import LLMEngine
@@ -17,6 +18,7 @@ from atom.config import (
     SpeculativeConfig,
 )
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -286,7 +288,7 @@ class EngineArgs:
         parser.add_argument(
             "--torch-profiler-dir",
             type=str,
-            default=None,
+            default=envs.ATOM_TORCH_PROFILER_DIR,
             help="Directory to save torch profiler traces",
         )
         parser.add_argument(
@@ -748,4 +750,13 @@ class EngineArgs:
 
     def create_engine(self, tokenizer=None) -> LLMEngine:
         """Create and return an LLMEngine instance with the configured parameters."""
+        if envs.ATOM_WORKLOAD_RECORD_PREFILL:
+            os.environ["ATOM_PREFILL_REPLAY_ENGINE_ARGS_JSON"] = json.dumps(
+                {
+                    field.name: getattr(self, field.name)
+                    for field in fields(self)
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
         return LLMEngine(self.model, tokenizer=tokenizer, **self._get_engine_kwargs())

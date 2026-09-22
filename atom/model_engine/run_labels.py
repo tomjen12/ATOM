@@ -20,6 +20,7 @@ Fields (``key=value`` inside brackets):
   - ``ctx``  per-seq context lengths (prefill/eager paths; truncated if many)
   - ``p``/``d``  prefill / decode seq counts (cudagraph decode path)
   - ``spec`` speculative steps (when > 0)
+  - ``replay_case`` native prefill capture identifier (when present)
   - ``tbo=1`` appended when the step ran Two-Batch-Overlap ubatches
 
 NOTE: ``tools/parse_trace.py`` selects real steps via ``startswith("prefill[")``
@@ -91,6 +92,9 @@ def build_run_label(
                 ctx_str = f"{ctx[:3].tolist()}...+{len(ctx) - 3}"
             label += f" tok={batch.total_tokens_num} ctx={ctx_str}"
     label += detailed_suffix
+    replay_case_id = getattr(batch, "replay_case_id", None)
+    if replay_case_id is not None:
+        label += f" replay_case={int(replay_case_id)}"
     if tbo_on:
         label += " tbo=1"
     label += "]"

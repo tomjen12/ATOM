@@ -19,6 +19,7 @@ class _FakeBatch:
     total_seqs_num_decode: int = 0
     num_spec_step: int = 0
     context_lens: object = None
+    replay_case_id: int | None = None
 
 
 def prefill_batch(tok, ctx):
@@ -129,6 +130,20 @@ class TestKindPrefix:
 
 
 class TestFields:
+    def test_replay_case_field(self):
+        batch = prefill_batch(4096, [4096])
+        batch.replay_case_id = 17
+        lbl = build_run_label(
+            is_prefill=True,
+            use_cudagraph=False,
+            is_dummy=False,
+            tbo_on=False,
+            scheduled_bs=1,
+            running_bs=1,
+            batch=batch,
+        )
+        assert " replay_case=17" in lbl
+
     def test_tbo_field(self):
         lbl = build_run_label(
             is_prefill=True,

@@ -5,6 +5,12 @@ import logging
 import queue
 from typing import ClassVar
 
+from atom.model_engine.prefill_replay import (
+    allocate_synthetic_replay_resources,
+    build_synthetic_replay_batch,
+    build_synthetic_replay_sequences,
+    release_synthetic_replay_resources,
+)
 from atom.model_engine.sequence import SequenceStatus
 
 logger = logging.getLogger("atom")
@@ -46,15 +52,22 @@ class EngineUtilityHandler:
         "get_mtp_statistics": "_handle_get_mtp_statistics",
         "get_cache_statistics": "_handle_get_cache_statistics",
         "abort_request": "_handle_abort_request",
+        "replay_synthetic_prefill": "_handle_replay_synthetic_prefill",
     }
 
     def __init__(
-        self, runner_mgr, output_queue, label: str = "Engine Core", scheduler=None
+        self,
+        runner_mgr,
+        output_queue,
+        label: str = "Engine Core",
+        scheduler=None,
+        prefill_replay_recorder=None,
     ):
         self.runner_mgr = runner_mgr
         self.output_queue = output_queue
         self.label = label
         self.scheduler = scheduler
+        self._prefill_replay_recorder = prefill_replay_recorder
 
     def process_queue(self, utility_queue, engine):
         """Drain *utility_queue* and execute each command.
@@ -229,6 +242,78 @@ class EngineUtilityHandler:
                 found = True
         logger.info(f"{self.label}: abort_request req_id={req_id} found={found}")
 
+    def _handle_replay_synthetic_prefill(self, args: dict):
+        """Run one captured EXTEND directly with fresh local cache resources."""
+        if self.scheduler is None:
+            raise RuntimeError("synthetic replay requires a local scheduler")
+        block_manager = getattr(self.scheduler, "block_manager", None)
+        if block_manager is None:
+            raise RuntimeError(
+                "synthetic replay requires a local KV block manager"
+            )
+        if self.scheduler.running or self.scheduler.waiting:
+            raise RuntimeError(
+                "synthetic replay requires an idle scheduler"
+            )
+
+        case = args["case"]
+        routes = args.get("moe_routes")
+        seqs = build_synthetic_replay_sequences(case)
+        prepared_routes = False
+        route_validation = None
+        try:
+            allocate_synthetic_replay_resources(
+                block_manager,
+                seqs,
+                case,
+            )
+            batch = build_synthetic_replay_batch(case, seqs)
+            if routes is not None:
+                prepared_routes = True
+                self.runner_mgr.call_func(
+                    "prepare_moe_route_replay",
+                    int(case["case_id"]),
+                    routes,
+                    wait_out=True,
+                )
+            output = self.runner_mgr.call_func(
+                "forward",
+                batch,
+                wait_out=True,
+            )
+            result = {
+                "case_id": int(case["case_id"]),
+                "request_count": len(seqs),
+                "scheduled_tokens": int(batch.total_tokens_num_prefill),
+                "moe_routes_injected": prepared_routes,
+                "output_request_ids": [
+                    int(req_id)
+                    for req_id in getattr(output, "req_ids", [])
+                ],
+            }
+        finally:
+            try:
+                if prepared_routes:
+                    route_validation = self.runner_mgr.call_func(
+                        "clear_moe_route_replay",
+                        wait_out=True,
+                    )
+            finally:
+                release_synthetic_replay_resources(
+                    block_manager,
+                    seqs,
+                )
+        result["moe_route_validation"] = route_validation
+        self.output_queue.put_nowait(
+            (
+                "UTILITY_RESPONSE",
+                {
+                    "cmd": "replay_synthetic_prefill",
+                    "result": result,
+                },
+            )
+        )
+
     def _handle_configure_hidden_states(self, args: dict):
         """Configure hidden states extraction on all model runners (TorchSpec)."""
         aux_layer_ids = args.get("aux_layer_ids", [])
@@ -250,6 +335,9 @@ class EngineUtilityHandler:
 
     def _handle_start_profile(self, args: dict):
         result = self.runner_mgr.call_func("start_profiler", wait_out=True)
+        replay_recorder = getattr(self, "_prefill_replay_recorder", None)
+        if replay_recorder is not None:
+            replay_recorder.start_trace_capture()
         # Flip the scheduler flag so per-iteration detailed aggregates
         # (compute_detailed_aggregates) are emitted while profiling is active.
         if self.scheduler is not None:
@@ -261,6 +349,9 @@ class EngineUtilityHandler:
 
     def _handle_stop_profile(self, args: dict):
         logger.info(f"{self.label}: stopping profiler...")
+        replay_recorder = getattr(self, "_prefill_replay_recorder", None)
+        if replay_recorder is not None:
+            replay_recorder.stop_trace_capture()
         result = self.runner_mgr.call_func("stop_profiler", wait_out=True)
         if self.scheduler is not None:
             self.scheduler.profile_active = False

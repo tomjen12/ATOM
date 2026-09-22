@@ -1317,6 +1317,27 @@ class CoreManager:
     def broadcast_utility_command_sync(
         self, cmd: str, timeout: float = 300.0, **kwargs
     ):
+        return self.utility_command_sync(
+            cmd,
+            range(len(self.control_sockets)),
+            timeout=timeout,
+            **kwargs,
+        )
+
+    def utility_command_sync(
+        self,
+        cmd: str,
+        engine_indices,
+        timeout: float = 300.0,
+        **kwargs,
+    ):
+        indices = list(engine_indices)
+        if not indices:
+            return []
+        if any(index < 0 or index >= len(self.control_sockets) for index in indices):
+            raise IndexError(
+                f"{self.label}: utility command engine index is out of range"
+            )
         # Drain any stale responses that might be left over
         while not self.utility_response_queue.empty():
             try:
@@ -1324,12 +1345,16 @@ class CoreManager:
             except queue.Empty:
                 break
 
-        self.broadcast_utility_command(cmd, **kwargs)
+        payload = {"cmd": cmd, **kwargs}
+        serialized_payload = pickle.dumps((EngineCoreRequestType.UTILITY, payload))
+        for index in indices:
+            logger.debug(
+                f"{self.label}: Send utility command '{cmd}' to engine {index}"
+            )
+            self._send_control(index, serialized_payload, copy=True)
 
-        # Collect one response per routable engine (must match the broadcast count
-        # len(self.control_sockets), which is the global engine count on a coordinator).
         responses = []
-        for _ in range(len(self.control_sockets)):
+        for _ in indices:
             try:
                 resp = self.utility_response_queue.get(timeout=timeout)
                 responses.append(resp)

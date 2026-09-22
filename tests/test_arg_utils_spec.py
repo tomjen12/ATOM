@@ -2,6 +2,8 @@
 # Regression tests for speculative-config validation in EngineArgs._get_engine_kwargs.
 
 import argparse
+import json
+import os
 import sys
 from unittest.mock import MagicMock, patch
 
@@ -173,6 +175,38 @@ class TestEngineArgsSpeculativeValidation:
             synthetic_acceptance_length=None,
         )
         assert kwargs["speculative_config"] is fake_spec_config
+
+
+class TestEngineArgsReplayCapture:
+    def test_create_engine_exports_exact_cli_configuration(self, monkeypatch):
+        monkeypatch.setenv("ATOM_WORKLOAD_RECORD_PREFILL", "1")
+        monkeypatch.delenv(
+            "ATOM_PREFILL_REPLAY_ENGINE_ARGS_JSON", raising=False
+        )
+        args = EngineArgs(
+            model="/models/Kimi-K3",
+            tensor_parallel_size=8,
+            decode_context_parallel_size=8,
+            kv_cache_dtype="fp8",
+            online_quant_config={"global_quant_config": "ptpc_fp8"},
+        )
+
+        with (
+            patch.object(args, "_get_engine_kwargs", return_value={}),
+            patch("atom.model_engine.arg_utils.LLMEngine"),
+        ):
+            args.create_engine()
+
+        captured = json.loads(
+            os.environ["ATOM_PREFILL_REPLAY_ENGINE_ARGS_JSON"]
+        )
+        assert captured["model"] == "/models/Kimi-K3"
+        assert captured["tensor_parallel_size"] == 8
+        assert captured["decode_context_parallel_size"] == 8
+        assert captured["kv_cache_dtype"] == "fp8"
+        assert captured["online_quant_config"] == {
+            "global_quant_config": "ptpc_fp8"
+        }
 
 
 class TestEngineArgsIndexCacheDtype:

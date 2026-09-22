@@ -28,6 +28,7 @@ from atom.config import (
     QuantizationConfig,
     get_current_atom_config,
 )
+from atom.model_engine.moe_route_replay import record as record_moe_route
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.eplb import eplb_map_and_record_fused
@@ -581,6 +582,13 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             ),
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
+        )
+        topk_logical = record_moe_route(
+            getattr(layer, "prefix", None)
+            or getattr(layer, "layer_name", None)
+            or f"layer.{getattr(layer, 'layer_id', 'unknown')}",
+            topk_logical,
+            layer.expert_layout.num_routed,
         )
         if layer.expert_layout.shared_is_routed:
             # EPLB places and records shared experts with routed experts.

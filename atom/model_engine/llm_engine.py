@@ -290,14 +290,51 @@ class LLMEngine:
         return outputs
 
     def start_profile(self):
-        self.core_mgr.broadcast_utility_command_sync("start_profile")
+        engine_indices = range(len(self.core_mgr.control_sockets))
+        if (
+            envs.ATOM_EXTEND_TRACE
+            and isinstance(self.core_mgr, DisaggCoreManager)
+        ):
+            engine_indices = [0]
+        self._profile_engine_indices = list(engine_indices)
+        self.core_mgr.utility_command_sync(
+            "start_profile", self._profile_engine_indices
+        )
         logger.info("Profiling started")
 
     def stop_profile(self) -> list[dict[str, Any]]:
-        responses = self.core_mgr.broadcast_utility_command_sync(
-            "stop_profile", timeout=envs.ATOM_PROFILER_TIMEOUT
+        engine_indices = getattr(
+            self,
+            "_profile_engine_indices",
+            range(len(self.core_mgr.control_sockets)),
         )
+        responses = self.core_mgr.utility_command_sync(
+            "stop_profile",
+            engine_indices,
+            timeout=envs.ATOM_PROFILER_TIMEOUT,
+        )
+        self._profile_engine_indices = []
         return [resp.get("result", {}) for resp in responses]
+
+    def replay_synthetic_prefill(
+        self,
+        case: dict[str, Any],
+        *,
+        moe_routes: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Execute one captured EXTEND directly on the first EngineCore."""
+        responses = self.core_mgr.utility_command_sync(
+            "replay_synthetic_prefill",
+            [0],
+            timeout=envs.ATOM_PROFILER_TIMEOUT,
+            case=case,
+            moe_routes=moe_routes,
+        )
+        if len(responses) != 1:
+            raise RuntimeError(
+                "synthetic replay expected one EngineCore response"
+            )
+        return responses[0].get("result", responses[0])
 
     def print_mtp_statistics(self):
         self.core_mgr.send_utility_command("get_mtp_stats")

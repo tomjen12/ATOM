@@ -21,7 +21,13 @@ _ATOM_ENV_VARS = [
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT",
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT",
     "ATOM_TORCH_PROFILER_DIR",
+    "ATOM_WORKLOAD_RECORD_ALL",
+    "ATOM_WORKLOAD_RECORD_PREFILL",
+    "ATOM_PREFILL_REPLAY_MAX_CASES",
     "ATOM_PROFILER_MORE",
+    "ATOM_PROFILER_RECORD_SHAPES",
+    "ATOM_PROFILER_WITH_STACK",
+    "ATOM_PROFILER_PROFILE_MEMORY",
     "ATOM_PROFILER_TIMEOUT",
     "ATOM_LOG_MORE",
     "ATOM_DISABLE_MMAP",
@@ -76,8 +82,22 @@ class TestEnvsDefaults:
     def test_torch_profiler_dir_default(self):
         assert _get_envs().ATOM_TORCH_PROFILER_DIR is None
 
+    def test_workload_record_all_default_disabled(self):
+        assert _get_envs().ATOM_WORKLOAD_RECORD_ALL is False
+
+    def test_workload_record_prefill_default_disabled(self):
+        assert _get_envs().ATOM_WORKLOAD_RECORD_PREFILL is False
+
+    def test_prefill_replay_max_cases_default(self):
+        assert _get_envs().ATOM_PREFILL_REPLAY_MAX_CASES == 0
+
     def test_profiler_more_default(self):
         assert _get_envs().ATOM_PROFILER_MORE is False
+
+    def test_profiler_details_default_disabled(self):
+        assert _get_envs().ATOM_PROFILER_RECORD_SHAPES is False
+        assert _get_envs().ATOM_PROFILER_WITH_STACK is False
+        assert _get_envs().ATOM_PROFILER_PROFILE_MEMORY is False
 
     def test_profiler_timeout_default(self):
         assert _get_envs().ATOM_PROFILER_TIMEOUT == 300.0
@@ -126,9 +146,33 @@ class TestEnvsOverrides:
         monkeypatch.setenv("ATOM_TORCH_PROFILER_DIR", "/tmp/prof")
         assert _get_envs().ATOM_TORCH_PROFILER_DIR == "/tmp/prof"
 
+    def test_workload_record_all_enabled(self, monkeypatch):
+        monkeypatch.setenv("ATOM_WORKLOAD_RECORD_ALL", "1")
+        assert _get_envs().ATOM_WORKLOAD_RECORD_ALL is True
+
+    def test_workload_record_prefill_enabled(self, monkeypatch):
+        monkeypatch.setenv("ATOM_WORKLOAD_RECORD_PREFILL", "1")
+        assert _get_envs().ATOM_WORKLOAD_RECORD_PREFILL is True
+
+    def test_prefill_replay_max_cases_override(self, monkeypatch):
+        monkeypatch.setenv("ATOM_PREFILL_REPLAY_MAX_CASES", "17")
+        assert _get_envs().ATOM_PREFILL_REPLAY_MAX_CASES == 17
+
     def test_profiler_more_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_PROFILER_MORE", "1")
         assert _get_envs().ATOM_PROFILER_MORE is True
+        assert _get_envs().ATOM_PROFILER_RECORD_SHAPES is True
+        assert _get_envs().ATOM_PROFILER_WITH_STACK is True
+        assert _get_envs().ATOM_PROFILER_PROFILE_MEMORY is True
+
+    def test_profiler_details_override_legacy_switch(self, monkeypatch):
+        monkeypatch.setenv("ATOM_PROFILER_MORE", "1")
+        monkeypatch.setenv("ATOM_PROFILER_RECORD_SHAPES", "1")
+        monkeypatch.setenv("ATOM_PROFILER_WITH_STACK", "0")
+        monkeypatch.setenv("ATOM_PROFILER_PROFILE_MEMORY", "0")
+        assert _get_envs().ATOM_PROFILER_RECORD_SHAPES is True
+        assert _get_envs().ATOM_PROFILER_WITH_STACK is False
+        assert _get_envs().ATOM_PROFILER_PROFILE_MEMORY is False
 
     def test_profiler_timeout_override(self, monkeypatch):
         monkeypatch.setenv("ATOM_PROFILER_TIMEOUT", "900")

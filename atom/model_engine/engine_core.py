@@ -6,7 +6,7 @@ import pickle
 import queue
 import threading
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 
 import torch
 import zmq
@@ -17,6 +17,8 @@ from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
+from atom.model_engine.gpu_timing import create_host_timing_recorder
+from atom.model_engine.prefill_replay import create_prefill_replay_recorder
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import (
     Sequence,
@@ -178,17 +180,19 @@ class EngineCore:
             # Physical: one output per launched worker, else this waits forever.
             self.kv_aggregator = KVOutputAggregator(world_size=config.tp_world_size)
 
+        # KV cache allocated, graphs captured, BlockPool built: everything this
+        # process holds for its lifetime exists, and the next thing is traffic.
+        self._freeze_after_startup()
+
+        self._host_timing_recorder = create_host_timing_recorder(config)
+        self._prefill_replay_recorder = create_prefill_replay_recorder(config)
         self.utility_handler = EngineUtilityHandler(
             self.runner_mgr,
             self.output_queue,
             label=self.label,
             scheduler=self.scheduler,
+            prefill_replay_recorder=self._prefill_replay_recorder,
         )
-
-        # KV cache allocated, graphs captured, BlockPool built: everything this
-        # process holds for its lifetime exists, and the next thing is traffic.
-        self._freeze_after_startup()
-
         self._send_ready_signal()
         logger.info(f"{self.label}: EngineCore fully initialized and ready")
 
@@ -249,6 +253,12 @@ class EngineCore:
         if not self.still_running:
             return
         self.still_running = False
+        host_timing_recorder = getattr(self, "_host_timing_recorder", None)
+        if host_timing_recorder is not None:
+            host_timing_recorder.close()
+        replay_recorder = getattr(self, "_prefill_replay_recorder", None)
+        if replay_recorder is not None:
+            replay_recorder.close()
         # Frozen weights and KV cache are unreachable *and* uncollectable, so
         # an engine destroyed in-process would read as a GPU memory leak.
         unfreeze_gc_heap()
@@ -352,11 +362,32 @@ class EngineCore:
                 if shutdown:
                     break
                 if self._is_idle_rl_weights_offloaded():
+                    host_timing_recorder = getattr(
+                        self, "_host_timing_recorder", None
+                    )
+                    if host_timing_recorder is not None:
+                        host_timing_recorder.start_idle()
                     continue
                 if not self.scheduler.is_finished():
+                    host_timing_recorder = getattr(
+                        self, "_host_timing_recorder", None
+                    )
+                    if host_timing_recorder is not None:
+                        host_timing_recorder.end_idle()
                     self._process_engine_step()
                 elif self.has_pending_kv_work():
+                    host_timing_recorder = getattr(
+                        self, "_host_timing_recorder", None
+                    )
+                    if host_timing_recorder is not None:
+                        host_timing_recorder.end_idle()
                     self._advance_idle_kv_transfer()
+                else:
+                    host_timing_recorder = getattr(
+                        self, "_host_timing_recorder", None
+                    )
+                    if host_timing_recorder is not None:
+                        host_timing_recorder.start_idle()
         finally:
             # Teardown runs even on exceptions so the sender thread/socket
             # don't leak. Isolate the final publish so a publisher hiccup
@@ -370,7 +401,8 @@ class EngineCore:
 
     def _process_engine_step(self):
         try:
-            return self._process_engine_step_inner()
+            with self._host_stage("scheduler_processing"):
+                return self._process_engine_step_inner()
         finally:
             # Swallow publisher errors so they cannot mask an exception from
             # the engine step itself.
@@ -380,7 +412,8 @@ class EngineCore:
                 logger.exception("KV event publish in engine-step finally failed")
 
     def _process_engine_step_inner(self):
-        result = self.scheduler.schedule()
+        with self._host_stage("get_next_batch_to_run"):
+            result = self.scheduler.schedule()
 
         # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
         # the scheduler) through the same finished-seq path as normal seqs.
@@ -412,10 +445,20 @@ class EngineCore:
         # Run the model forward pass if there are actual sequences
         has_seqs = len(scheduled_batch.req_ids) > 0
         if has_seqs:
-            self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
-            fwd_out = self.runner_mgr.call_func(
-                "forward", scheduled_batch, wait_out=True
+            replay_recorder = getattr(self, "_prefill_replay_recorder", None)
+            replay_case_id = (
+                replay_recorder.record_batch(scheduled_batch, seqs)
+                if replay_recorder is not None
+                else None
             )
+            scheduled_batch.replay_case_id = replay_case_id
+            with self._host_stage("run_batch"):
+                self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
+                fwd_out = self.runner_mgr.call_func(
+                    "forward", scheduled_batch, wait_out=True
+                )
+            if replay_recorder is not None:
+                replay_recorder.record_result(replay_case_id, fwd_out)
             if (
                 self.scheduler.prefill_delayer is not None
                 and scheduled_batch.total_seqs_num_prefill > 0
@@ -432,26 +475,27 @@ class EngineCore:
             logger.debug("%s: Empty scheduled batch, skipping postprocess", self.label)
             return False
 
-        seqs = seqs.values()
-        # Pass stream_output_queue to postprocess for streaming callbacks
-        finished_seqs = self.scheduler.postprocess(
-            seqs,
-            fwd_out,
-            stream_output_queue=self.stream_output_queue,
-            batch=scheduled_batch,
-        )
+        with self._host_stage("process_batch_result"):
+            seqs = seqs.values()
+            # Pass stream_output_queue to postprocess for streaming callbacks
+            finished_seqs = self.scheduler.postprocess(
+                seqs,
+                fwd_out,
+                stream_output_queue=self.stream_output_queue,
+                batch=scheduled_batch,
+            )
 
-        # Send stream outputs to main process via output_queue
-        try:
-            while not self.stream_output_queue.empty():
-                stream_outputs = self.stream_output_queue.get_nowait()
-                # Send stream outputs as intermediate results
-                self.output_queue.put_nowait(("STREAM", stream_outputs))
-        except queue.Empty:
-            pass
+            # Send stream outputs to main process via output_queue
+            try:
+                while not self.stream_output_queue.empty():
+                    stream_outputs = self.stream_output_queue.get_nowait()
+                    # Send stream outputs as intermediate results
+                    self.output_queue.put_nowait(("STREAM", stream_outputs))
+            except queue.Empty:
+                pass
 
-        if finished_seqs:
-            self.output_queue.put_nowait(finished_seqs)
+            if finished_seqs:
+                self.output_queue.put_nowait(finished_seqs)
 
         return True
 
@@ -569,18 +613,39 @@ class EngineCore:
         self.runner_mgr.call_func("process_kvconnector_output", meta)
 
     def pull_and_process_input_queue(self):
+        if self.input_queue.empty():
+            return False
+        host_timing_recorder = getattr(self, "_host_timing_recorder", None)
+        if host_timing_recorder is not None:
+            host_timing_recorder.end_idle()
+
         recv_reqs = []
-        while not self.input_queue.empty():
-            seqs = self.input_queue.get_nowait()
-            for seq in seqs:
-                if seq.status == SequenceStatus.EXIT_ENGINE:
-                    logger.debug(f"{self.label}: input_queue get exit engine")
-                    return True
-                recv_reqs.append(seq)
-        if len(recv_reqs) > 0:
-            logger.debug(f"{self.label}: put {len(recv_reqs)} reqs to scheduler")
-            self.scheduler.extend(recv_reqs)
+        with self._host_stage("scheduler_processing"):
+            with self._host_stage("recv_requests"):
+                while not self.input_queue.empty():
+                    seqs = self.input_queue.get_nowait()
+                    for seq in seqs:
+                        if seq.status == SequenceStatus.EXIT_ENGINE:
+                            logger.debug(f"{self.label}: input_queue get exit engine")
+                            return True
+                        recv_reqs.append(seq)
+            if len(recv_reqs) > 0:
+                logger.debug(f"{self.label}: put {len(recv_reqs)} reqs to scheduler")
+                with self._host_stage("process_input_requests"):
+                    self.scheduler.extend(recv_reqs)
         return False
+
+    @contextmanager
+    def _host_stage(self, stage: str):
+        recorder = getattr(self, "_host_timing_recorder", None)
+        if recorder is None:
+            yield
+            return
+        start_ns = time.time_ns()
+        try:
+            yield
+        finally:
+            recorder.record(stage, start_ns, time.time_ns())
 
     def process_input_sockets(self, input_address: str, control_address: str):
         """Input IO thread, serving both the request and control sockets.

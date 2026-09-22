@@ -18,6 +18,7 @@ import multiprocessing
 import pickle
 import queue
 import threading
+import time
 import weakref
 from contextlib import ExitStack
 from threading import Thread
@@ -166,7 +167,17 @@ class AsyncIOProc:
         runner_class = resolve_obj_by_qualname(runner_qualname)
         self.runners: list[object] = []
         self.runners = [runner_class(rank, *args, **kwargs)]
-        self.busy_loop()
+        self._run_busy_loop_with_cleanup()
+
+    def _run_busy_loop_with_cleanup(self):
+        try:
+            self.busy_loop()
+        finally:
+            # RPC handlers run inside this process and may raise after GPU,
+            # profiler, or distributed resources have been created.  Always
+            # execute the runner cleanup path before the process unwinds so a
+            # Python exception cannot strand KFD/custom-all-reduce resources.
+            self.exit()
 
     def exit(self):
         if not getattr(self, "still_running", True):
@@ -174,7 +185,10 @@ class AsyncIOProc:
         self.still_running = False
         logger.debug(f"{self.label}: Shutting down runner...")
         for el in self.runners:
-            el.exit()
+            try:
+                el.exit()
+            except Exception:  # noqa: BLE001 - finish process teardown
+                logger.exception("%s: runner cleanup failed", self.label)
         # Close shared memory reader handle to prevent resource_tracker leak
         self._cleanup_shared_memory()
         for t in self.io_threads:
@@ -356,12 +370,24 @@ class AsyncIOProcManager:
         if not self.still_running:
             return
         self.still_running = False
-        self._cleanup_shared_memory()
         logger.info(f"{self.label}: shutdown all runners...")
-        for proc in self.procs:
-            if proc.is_alive():
-                proc.join(timeout=5)
-        shutdown_all_processes(self.procs, allowed_seconds=1)
+        alive = [proc for proc in self.procs if proc.is_alive()]
+        if alive:
+            try:
+                # Give every surviving worker a normal RPC exit first.  That
+                # invokes ModelRunner.exit(), which destroys custom all-reduce
+                # and process groups before GPU tensors are released.
+                self.rpc_broadcast_mq.enqueue(("exit",))
+            except Exception:  # noqa: BLE001 - continue with forced cleanup
+                logger.exception(
+                    "%s: failed to broadcast graceful runner exit",
+                    self.label,
+                )
+        deadline = time.monotonic() + 30
+        for proc in alive:
+            proc.join(max(deadline - time.monotonic(), 0))
+        self._cleanup_shared_memory()
+        shutdown_all_processes(self.procs, allowed_seconds=10)
         self.procs = []
         self.output_thread.join(timeout=1)
         for thread in self.kv_output_threads:
