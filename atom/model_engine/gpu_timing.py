@@ -33,7 +33,9 @@ class _ForwardTiming:
     role: str
     input_token_count: int
     sequence_count: int
-    start: torch.cuda.Event
+    host_start_ns: int
+    start: torch.cuda.Event | None
+    host_end_ns: int | None = None
     end: torch.cuda.Event | None = None
 
 
@@ -55,9 +57,12 @@ class _BatchTiming:
 class GpuTimingRecorder:
     """Record one GPU envelope and its target/draft forwards per runner batch."""
 
-    def __init__(self, runner: Any, output_dir: str):
+    def __init__(
+        self, runner: Any, output_dir: str, *, gpu_timing_enabled: bool
+    ):
         self.runner = runner
         self.output_dir = output_dir
+        self.gpu_timing_enabled = bool(gpu_timing_enabled)
         self._next_batch_id = 0
         self._active_batch: _BatchTiming | None = None
         self._queue: queue.Queue[_BatchTiming | None] = queue.Queue()
@@ -73,12 +78,14 @@ class GpuTimingRecorder:
         self.path = os.path.join(output_dir, filename)
         self._file = open(self.path, "a", encoding="utf-8", buffering=1)
 
-        self._anchor = torch.cuda.Event(enable_timing=True)
-        self._anchor.record(torch.cuda.current_stream(runner.device))
+        self._anchor = None
         self._anchor_epoch_ns = time.time_ns()
-        for stream in self._streams():
-            if stream != torch.cuda.current_stream(runner.device):
-                stream.wait_event(self._anchor)
+        if self.gpu_timing_enabled:
+            self._anchor = torch.cuda.Event(enable_timing=True)
+            self._anchor.record(torch.cuda.current_stream(runner.device))
+            for stream in self._streams():
+                if stream != torch.cuda.current_stream(runner.device):
+                    stream.wait_event(self._anchor)
 
         self._writer = threading.Thread(
             target=self._writer_loop,
@@ -86,7 +93,11 @@ class GpuTimingRecorder:
             daemon=True,
         )
         self._writer.start()
-        logger.info("GPU envelope timing enabled: %s", self.path)
+        logger.info(
+            "Forward workload recording enabled (gpu_timing=%s): %s",
+            self.gpu_timing_enabled,
+            self.path,
+        )
 
     def _streams(self) -> list[torch.cuda.Stream]:
         streams = [torch.cuda.current_stream(self.runner.device)]
@@ -118,7 +129,11 @@ class GpuTimingRecorder:
             num_sequences=int(getattr(batch, "total_seqs_num", 0)),
             host_start_ns=time.time_ns(),
             host_end_ns=None,
-            start_events=[self._event(stream) for stream in self._streams()],
+            start_events=(
+                [self._event(stream) for stream in self._streams()]
+                if self.gpu_timing_enabled
+                else []
+            ),
         )
 
     def end_batch(self) -> None:
@@ -127,7 +142,11 @@ class GpuTimingRecorder:
         if timing is None:
             return
         timing.host_end_ns = time.time_ns()
-        timing.end_events = [self._event(stream) for stream in self._streams()]
+        timing.end_events = (
+            [self._event(stream) for stream in self._streams()]
+            if self.gpu_timing_enabled
+            else []
+        )
         self._queue.put(timing)
 
     def begin_forward(
@@ -145,16 +164,26 @@ class GpuTimingRecorder:
             role=role,
             input_token_count=input_token_count,
             sequence_count=sequence_count,
-            start=self._event(torch.cuda.current_stream(self.runner.device)),
+            host_start_ns=time.time_ns(),
+            start=(
+                self._event(torch.cuda.current_stream(self.runner.device))
+                if self.gpu_timing_enabled
+                else None
+            ),
         )
         batch.forwards.append(timing)
         return timing
 
     def end_forward(self, timing: _ForwardTiming | None) -> None:
         if timing is not None:
-            timing.end = self._event(torch.cuda.current_stream(self.runner.device))
+            timing.host_end_ns = time.time_ns()
+            if self.gpu_timing_enabled:
+                timing.end = self._event(
+                    torch.cuda.current_stream(self.runner.device)
+                )
 
     def _offset_ms(self, event: torch.cuda.Event) -> float:
+        assert self._anchor is not None
         return float(self._anchor.elapsed_time(event))
 
     def _serialize(self, timing: _BatchTiming) -> dict[str, Any]:
@@ -165,27 +194,29 @@ class GpuTimingRecorder:
         end_offsets = [self._offset_ms(event) for event in timing.end_events]
         forwards = []
         for forward in timing.forwards:
-            if forward.end is None:
-                continue
-            start_ms = self._offset_ms(forward.start)
-            end_ms = self._offset_ms(forward.end)
-            forwards.append(
-                {
-                    "mode": forward.mode,
-                    "role": forward.role,
-                    "input_token_count": forward.input_token_count,
-                    "sequence_count": forward.sequence_count,
-                    "start_ms": start_ms,
-                    "end_ms": end_ms,
-                    "start_epoch_ns": self._anchor_epoch_ns
-                    + round(start_ms * 1_000_000),
-                    "end_epoch_ns": self._anchor_epoch_ns
-                    + round(end_ms * 1_000_000),
-                }
-            )
-        gpu_start_ms = min(start_offsets)
-        gpu_end_ms = max(end_offsets)
-        return {
+            record = {
+                "mode": forward.mode,
+                "role": forward.role,
+                "input_token_count": forward.input_token_count,
+                "sequence_count": forward.sequence_count,
+                "host_start_ns": forward.host_start_ns,
+                "host_end_ns": forward.host_end_ns,
+            }
+            if forward.start is not None and forward.end is not None:
+                start_ms = self._offset_ms(forward.start)
+                end_ms = self._offset_ms(forward.end)
+                record.update(
+                    {
+                        "start_ms": start_ms,
+                        "end_ms": end_ms,
+                        "start_epoch_ns": self._anchor_epoch_ns
+                        + round(start_ms * 1_000_000),
+                        "end_epoch_ns": self._anchor_epoch_ns
+                        + round(end_ms * 1_000_000),
+                    }
+                )
+            forwards.append(record)
+        record = {
             "schema_version": 2,
             "batch_id": timing.batch_id,
             "replay_case_id": timing.replay_case_id,
@@ -195,16 +226,25 @@ class GpuTimingRecorder:
             "num_sequences": timing.num_sequences,
             "host_start_ns": timing.host_start_ns,
             "host_end_ns": timing.host_end_ns,
-            "gpu_start_ms": gpu_start_ms,
-            "gpu_end_ms": gpu_end_ms,
-            "gpu_start_epoch_ns": self._anchor_epoch_ns
-            + round(gpu_start_ms * 1_000_000),
-            "gpu_end_epoch_ns": self._anchor_epoch_ns
-            + round(gpu_end_ms * 1_000_000),
-            "stream_start_ms": start_offsets,
-            "stream_end_ms": end_offsets,
+            "gpu_timing_enabled": self.gpu_timing_enabled,
             "forwards": forwards,
         }
+        if start_offsets and end_offsets:
+            gpu_start_ms = min(start_offsets)
+            gpu_end_ms = max(end_offsets)
+            record.update(
+                {
+                    "gpu_start_ms": gpu_start_ms,
+                    "gpu_end_ms": gpu_end_ms,
+                    "gpu_start_epoch_ns": self._anchor_epoch_ns
+                    + round(gpu_start_ms * 1_000_000),
+                    "gpu_end_epoch_ns": self._anchor_epoch_ns
+                    + round(gpu_end_ms * 1_000_000),
+                    "stream_start_ms": start_offsets,
+                    "stream_end_ms": end_offsets,
+                }
+            )
+        return record
 
     def _writer_loop(self) -> None:
         while True:
@@ -230,10 +270,18 @@ class GpuTimingRecorder:
 def create_gpu_timing_recorder(runner: Any) -> GpuTimingRecorder | None:
     """Create a recorder on one representative TP rank when explicitly enabled."""
 
-    output_dir = os.getenv("ATOM_GPU_TIMING_DIR")
-    if not envs.ATOM_WORKLOAD_RECORD_ALL or not output_dir or runner.rank != 0:
+    output_dir = os.getenv("ATOM_WORKLOAD_RECORD_FORWARD_DIR")
+    if (
+        not envs.ATOM_WORKLOAD_RECORD_FORWARD
+        or not output_dir
+        or runner.rank != 0
+    ):
         return None
-    return GpuTimingRecorder(runner, output_dir)
+    return GpuTimingRecorder(
+        runner,
+        output_dir,
+        gpu_timing_enabled=envs.ATOM_WORKLOAD_RECORD_GPU_TIMING,
+    )
 
 
 class HostTimingRecorder:
@@ -297,10 +345,10 @@ class HostTimingRecorder:
 
 
 def create_host_timing_recorder(config: Any) -> HostTimingRecorder | None:
-    output_dir = os.getenv("ATOM_GPU_TIMING_DIR")
+    output_dir = os.getenv("ATOM_WORKLOAD_RECORD_FORWARD_DIR")
     parallel = config.parallel_config
     if (
-        not envs.ATOM_WORKLOAD_RECORD_ALL
+        not envs.ATOM_WORKLOAD_RECORD_GPU_TIMING
         or not output_dir
         or parallel.data_parallel_rank != 0
     ):
@@ -315,7 +363,7 @@ def create_host_timing_recorder(config: Any) -> HostTimingRecorder | None:
 def gpu_timing_batch_method(method):
     @wraps(method)
     def wrapped(self, batch, *args, **kwargs):
-        prefill_only_trace = envs.ATOM_EXTEND_TRACE
+        prefill_only_trace = envs.ATOM_PREFILL_KERNEL_TRACE
         collect_trace = bool(
             int(getattr(batch, "total_tokens_num_prefill", 0)) > 0
             and int(getattr(batch, "total_tokens_num_decode", 0)) == 0

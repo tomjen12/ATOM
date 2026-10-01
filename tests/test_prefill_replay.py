@@ -125,7 +125,7 @@ def test_recorder_captures_engine_args_and_runtime_env(tmp_path, monkeypatch):
 
 
 def test_trace_only_recorder_activates_with_profiler(tmp_path, monkeypatch):
-    monkeypatch.setenv("ATOM_EXTEND_TRACE", "1")
+    monkeypatch.setenv("ATOM_PREFILL_KERNEL_TRACE", "1")
     monkeypatch.delenv("ATOM_PREFILL_REPLAY_ENGINE_ARGS_JSON", raising=False)
     config = SimpleNamespace(
         model="/models/Kimi-K3",

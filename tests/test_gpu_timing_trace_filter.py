@@ -34,7 +34,7 @@ def _batch(*, prefill, decode, replay_case_id=None):
 
 
 def test_prefill_only_trace_profiles_only_pure_extend(monkeypatch):
-    monkeypatch.setenv("ATOM_EXTEND_TRACE", "1")
+    monkeypatch.setenv("ATOM_PREFILL_KERNEL_TRACE", "1")
     runner = _Runner()
 
     runner.forward(_batch(prefill=16, decode=0, replay_case_id=7))

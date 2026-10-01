@@ -1165,11 +1165,11 @@ class ModelRunner:
         separate replay input.
 
         Detailed profiling features are controlled independently by
-        ATOM_PROFILER_RECORD_SHAPES, ATOM_PROFILER_WITH_STACK, and
-        ATOM_PROFILER_PROFILE_MEMORY.  Unset controls inherit the legacy
+        ATOM_PROFILE_RECORD_SHAPES, ATOM_PROFILE_WITH_STACK, and
+        ATOM_PROFILE_MEMORY.  Unset controls inherit the legacy
         ATOM_PROFILER_MORE value.
         """
-        if envs.ATOM_EXTEND_TRACE and self.rank != 0:
+        if envs.ATOM_PREFILL_KERNEL_TRACE and self.rank != 0:
             logger.info(
                 "Rank %d: skipping EXTEND profiler (rank 0 only)",
                 self.rank,
@@ -1180,16 +1180,16 @@ class ModelRunner:
                 "torch profiler output is not configured; set "
                 "ATOM_TORCH_PROFILER_DIR or --torch-profiler-dir"
             )
-        if envs.ATOM_EXTEND_TRACE:
+        if envs.ATOM_PREFILL_KERNEL_TRACE:
             self._extend_trace_armed = True
             self._extend_trace_started_at = time.monotonic()
             logger.info(
                 "Rank %d: armed per-forward EXTEND profiler "
                 "(shapes=%s, stack=%s, memory=%s, dir=%s)",
                 self.rank,
-                envs.ATOM_PROFILER_RECORD_SHAPES,
-                envs.ATOM_PROFILER_WITH_STACK,
-                envs.ATOM_PROFILER_PROFILE_MEMORY,
+                envs.ATOM_PROFILE_RECORD_SHAPES,
+                envs.ATOM_PROFILE_WITH_STACK,
+                envs.ATOM_PROFILE_MEMORY,
                 self.profiler_dir,
             )
             return True
@@ -1259,9 +1259,9 @@ class ModelRunner:
                     torch_profiler.ProfilerActivity.CPU,
                     torch_profiler.ProfilerActivity.CUDA,
                 ],
-                record_shapes=envs.ATOM_PROFILER_RECORD_SHAPES,
-                with_stack=envs.ATOM_PROFILER_WITH_STACK,
-                profile_memory=envs.ATOM_PROFILER_PROFILE_MEMORY,
+                record_shapes=envs.ATOM_PROFILE_RECORD_SHAPES,
+                with_stack=envs.ATOM_PROFILE_WITH_STACK,
+                profile_memory=envs.ATOM_PROFILE_MEMORY,
                 on_trace_ready=_on_trace_ready,
             )
             self.profiler.__enter__()
@@ -1270,9 +1270,9 @@ class ModelRunner:
                 "Rank %d: profiler started "
                 "(shapes=%s, stack=%s, memory=%s, dir=%s, steps=%s)",
                 self.rank,
-                envs.ATOM_PROFILER_RECORD_SHAPES,
-                envs.ATOM_PROFILER_WITH_STACK,
-                envs.ATOM_PROFILER_PROFILE_MEMORY,
+                envs.ATOM_PROFILE_RECORD_SHAPES,
+                envs.ATOM_PROFILE_WITH_STACK,
+                envs.ATOM_PROFILE_MEMORY,
                 self.profiler_dir,
                 self._runtime_trace_steps_remaining,
             )
@@ -1292,9 +1292,9 @@ class ModelRunner:
                 torch_profiler.ProfilerActivity.CPU,
                 torch_profiler.ProfilerActivity.CUDA,
             ],
-            record_shapes=envs.ATOM_PROFILER_RECORD_SHAPES,
-            with_stack=envs.ATOM_PROFILER_WITH_STACK,
-            profile_memory=envs.ATOM_PROFILER_PROFILE_MEMORY,
+            record_shapes=envs.ATOM_PROFILE_RECORD_SHAPES,
+            with_stack=envs.ATOM_PROFILE_WITH_STACK,
+            profile_memory=envs.ATOM_PROFILE_MEMORY,
         )
         self._extend_trace_case_id = int(case_id)
         try:
@@ -1366,7 +1366,7 @@ class ModelRunner:
         Returns a dict with ``trace_dir`` and ``elapsed`` so the caller
         can report where the trace was written.
         """
-        if envs.ATOM_EXTEND_TRACE and self._extend_trace_armed:
+        if envs.ATOM_PREFILL_KERNEL_TRACE and self._extend_trace_armed:
             t0 = self._extend_trace_started_at or time.monotonic()
             self._extend_trace_armed = False
             if self.profiler is not None:
@@ -3808,9 +3808,9 @@ class ModelRunner:
                 # capture loop lands in its own file with nothing dropped between
                 # them (wait>0 would silently skip alternate batch sizes).
                 schedule=torch_profiler.schedule(wait=0, warmup=0, active=1, repeat=0),
-                record_shapes=envs.ATOM_PROFILER_RECORD_SHAPES,
-                with_stack=envs.ATOM_PROFILER_WITH_STACK,
-                profile_memory=envs.ATOM_PROFILER_PROFILE_MEMORY,
+                record_shapes=envs.ATOM_PROFILE_RECORD_SHAPES,
+                with_stack=envs.ATOM_PROFILE_WITH_STACK,
+                profile_memory=envs.ATOM_PROFILE_MEMORY,
                 on_trace_ready=on_trace_ready,
             )
         else:

@@ -292,7 +292,7 @@ class LLMEngine:
     def start_profile(self):
         engine_indices = range(len(self.core_mgr.control_sockets))
         if (
-            envs.ATOM_EXTEND_TRACE
+            envs.ATOM_PREFILL_KERNEL_TRACE
             and isinstance(self.core_mgr, DisaggCoreManager)
         ):
             engine_indices = [0]

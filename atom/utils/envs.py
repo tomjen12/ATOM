@@ -261,18 +261,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # runner forwards. The runner validates that the value is positive.
     "ATOM_RUNTIME_TRACE": lambda: os.getenv("ATOM_RUNTIME_TRACE", "0") == "1",
     "ATOM_RUNTIME_TRACE_STEPS": lambda: int(
-        os.getenv("ATOM_RUNTIME_TRACE_STEPS", "100")
+        os.getenv("ATOM_RUNTIME_TRACE_STEPS", "1000")
     ),
     # Profile only pure prefill/EXTEND batches for the active profiling window.
     # Unlike ATOM_RUNTIME_TRACE, this mode is stopped by the benchmark phase,
     # not by ATOM_RUNTIME_TRACE_STEPS.
-    "ATOM_EXTEND_TRACE": lambda: (
-        os.getenv("ATOM_EXTEND_TRACE", "0") == "1"
+    "ATOM_PREFILL_KERNEL_TRACE": lambda: (
+        os.getenv("ATOM_PREFILL_KERNEL_TRACE", "0") == "1"
     ),
-    # Record rank-zero scheduler-batch and target/draft GPU envelopes without
-    # collecting a heavyweight PyTorch/Runtime trace.
-    "ATOM_WORKLOAD_RECORD_ALL": lambda: (
-        os.getenv("ATOM_WORKLOAD_RECORD_ALL", "0") == "1"
+    # Record rank-zero scheduler-batch and target/draft forward census.
+    "ATOM_WORKLOAD_RECORD_FORWARD": lambda: (
+        os.getenv("ATOM_WORKLOAD_RECORD_FORWARD", "0") == "1"
+    ),
+    # Add asynchronous CUDA/HIP event timing to forward census records.
+    "ATOM_WORKLOAD_RECORD_GPU_TIMING": lambda: (
+        os.getenv(
+            "ATOM_WORKLOAD_RECORD_GPU_TIMING",
+            os.getenv("ATOM_WORKLOAD_RECORD_FORWARD", "0"),
+        )
+        == "1"
     ),
     # Move the startup heap (model, compiled graph, tokenizer, KV block pool)
     # into CPython's permanent generation once warmup is done, so collections
@@ -290,23 +297,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
     # Independent torch.profiler controls.  An unset control inherits
     # ATOM_PROFILER_MORE so the legacy all-or-nothing switch remains compatible.
-    "ATOM_PROFILER_RECORD_SHAPES": lambda: (
+    "ATOM_PROFILE_RECORD_SHAPES": lambda: (
         os.getenv(
-            "ATOM_PROFILER_RECORD_SHAPES",
+            "ATOM_PROFILE_RECORD_SHAPES",
             os.getenv("ATOM_PROFILER_MORE", "0"),
         )
         == "1"
     ),
-    "ATOM_PROFILER_WITH_STACK": lambda: (
+    "ATOM_PROFILE_WITH_STACK": lambda: (
         os.getenv(
-            "ATOM_PROFILER_WITH_STACK",
+            "ATOM_PROFILE_WITH_STACK",
             os.getenv("ATOM_PROFILER_MORE", "0"),
         )
         == "1"
     ),
-    "ATOM_PROFILER_PROFILE_MEMORY": lambda: (
+    "ATOM_PROFILE_MEMORY": lambda: (
         os.getenv(
-            "ATOM_PROFILER_PROFILE_MEMORY",
+            "ATOM_PROFILE_MEMORY",
             os.getenv("ATOM_PROFILER_MORE", "0"),
         )
         == "1"

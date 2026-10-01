@@ -37,11 +37,11 @@ _REPLAY_RUNTIME_ENV_NAMES = (
     "ATOM_NUMA_NODE",
     "ATOM_AUTO_NUMA_BIND",
     "ATOM_STATE_CHECKPOINT_DEMAND",
-    "ATOM_EXTEND_TRACE",
+    "ATOM_PREFILL_KERNEL_TRACE",
     "ATOM_PROFILER_MORE",
-    "ATOM_PROFILER_RECORD_SHAPES",
-    "ATOM_PROFILER_WITH_STACK",
-    "ATOM_PROFILER_PROFILE_MEMORY",
+    "ATOM_PROFILE_RECORD_SHAPES",
+    "ATOM_PROFILE_WITH_STACK",
+    "ATOM_PROFILE_MEMORY",
     "AITER_LOG_LEVEL",
     "AITER_SITUV2_A4W4",
     "AITER_QUICK_REDUCE_QUANTIZATION",
@@ -293,7 +293,7 @@ def build_prefill_case_record(
             "counts": "moe_counts.uint16.bin",
         },
     }
-    if envs.ATOM_EXTEND_TRACE:
+    if envs.ATOM_PREFILL_KERNEL_TRACE:
         record["trace"] = {
             "rank": 0,
             "path": (
@@ -404,7 +404,9 @@ class PrefillReplayRecorder:
         self._queue: queue.Queue[dict[str, Any] | object] = queue.Queue()
         self._max_cases = max_cases
         self._next_case_id = 0
-        self._trace_only = envs.ATOM_RUNTIME_TRACE or envs.ATOM_EXTEND_TRACE
+        self._trace_only = (
+            envs.ATOM_RUNTIME_TRACE or envs.ATOM_PREFILL_KERNEL_TRACE
+        )
         self._trace_active = not self._trace_only
         self._closed = False
         self._thread = threading.Thread(
